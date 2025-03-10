@@ -27,12 +27,12 @@ def get_mailchimp_campaign(campaign_id):
         "Content-Type": "application/json"
     }
 
-    # Get HTML content
+    # 1) Get HTML content
     content_res = requests.get(content_url, headers=headers)
     content_res.raise_for_status()
     content_json = content_res.json()
 
-    # Get subject line
+    # 2) Get subject line
     details_res = requests.get(details_url, headers=headers)
     details_res.raise_for_status()
     subject_line = details_res.json().get('settings', {}).get('subject_line', '')
@@ -42,6 +42,10 @@ def get_mailchimp_campaign(campaign_id):
 
 
 def parse_email_content(campaign_data):
+    """
+    Extract text blocks, images, and CTA from Mailchimp HTML,
+    skipping logos, signatures, social icons, etc.
+    """
     html = campaign_data.get('html', '')
     soup = BeautifulSoup(html, 'html.parser')
 
@@ -52,7 +56,7 @@ def parse_email_content(campaign_data):
         'call_to_action': None
     }
 
-    # Grab paragraphs & list items
+    # 1) Text
     for elem in soup.find_all(['p', 'li']):
         text = elem.get_text(strip=True)
         if text:
@@ -61,41 +65,29 @@ def parse_email_content(campaign_data):
                 'content': text
             })
 
-    # Grab all images initially
+    # 2) Images (filter out known unwanted items)
     all_imgs = soup.select('img')
-
-    # 1) Filter out any that mention "logo" or "signature" in alt or src
     filtered_images = []
     for img in all_imgs:
-        src = img.get('src')
+        src = img.get('src') or ''
         alt = img.get('alt', '')
-        if not src:
-            continue
-
         src_lower = src.lower()
         alt_lower = alt.lower()
 
-        # Skip if "logo" or "signature" in either alt or src
-        if "logo" in src_lower or "logo" in alt_lower or "signature" in src_lower or "signature" in alt_lower:
+        # If either alt/src mention these, skip
+        unwanted = ['logo', 'signature', 'facebook', 'twitter', 'instagram', 'footer', 'social']
+        if any(uw in src_lower for uw in unwanted) or any(uw in alt_lower for uw in unwanted):
             continue
 
-        filtered_images.append(img)
+        if src:
+            filtered_images.append({
+                'url': src,
+                'alt': alt
+            })
 
-    # 2) Exclude the first & last from that filtered list
-    # (only if we have at least 3 images; otherwise slicing might remove everything)
-    if len(filtered_images) > 2:
-        filtered_images = filtered_images[1:-1]
+    structured['images'] = filtered_images
 
-    # Now store the final images in structured_content
-    for img in filtered_images:
-        src = img.get('src')
-        alt = img.get('alt', '')
-        structured['images'].append({
-            'url': src,
-            'alt': alt
-        })
-
-    # Finally, parse CTA if needed
+    # 3) CTA
     cta = soup.select_one('a.mcnButton')
     if cta:
         structured['call_to_action'] = {
@@ -106,22 +98,20 @@ def parse_email_content(campaign_data):
     return structured
 
 
-
 def download_image(image_url):
-    """Download the remote image bytes from Mailchimp or any URL."""
+    """Download the remote image bytes."""
     resp = requests.get(image_url)
     resp.raise_for_status()
-    return resp.content  # raw binary data
+    return resp.content
 
 
 def upload_to_wp_media(image_binary, filename, alt_text, wp_url, headers):
     """
-    Upload the binary image data to the WP Media Library via REST API.
-    Returns the JSON response, including 'id' and 'source_url'.
+    Upload image data to WP Media Library. Return JSON (including 'id', 'source_url').
     """
     media_url = f"{wp_url}/wp-json/wp/v2/media"
 
-    # We'll guess the content type from the extension, or just default to image/jpeg
+    # Guess content type from extension
     content_type = "image/jpeg"
     if filename.lower().endswith(".png"):
         content_type = "image/png"
@@ -134,103 +124,17 @@ def upload_to_wp_media(image_binary, filename, alt_text, wp_url, headers):
         'alt_text': alt_text
     }
 
-    # Must use "files=..." to send multipart/form-data
     upload_resp = requests.post(media_url, headers=headers, files=files, data=data)
     upload_resp.raise_for_status()
     return upload_resp.json()
 
 
-def build_gutenberg_blocks(structured_content, wp_url, headers):
-    """
-    Turn text blocks, images, and CTA into valid Gutenberg block HTML,
-    *uploading each remote image* to WP Media, referencing its local URL/ID.
-    """
-    # --- 1) MERGE ALL PARAGRAPHS INTO ONE BLOCK ---
-    merged_text = []
-    seen = set()
-    for block in structured_content["text_blocks"]:
-        text = block["content"].strip()
-        if not text or text in seen:
-            continue  # skip empty or exact duplicate
-        seen.add(text)
-        merged_text.append(text)
-    big_paragraph = "\n\n".join(merged_text)  # separate paragraphs with double line breaks
-
-    blocks_html = []
-
-    # Create a single paragraph block (or multiple if you prefer)
-    if big_paragraph:
-        text_escaped = big_paragraph.replace('"', '\\"')
-        paragraph_block = (
-            f'<!-- wp:paragraph -->'
-            f'<p>{text_escaped}</p>'
-            f'<!-- /wp:paragraph -->'
-        )
-        blocks_html.append(paragraph_block)
-
-    # --- 2) For each image, upload to WP media, then build local image blocks
-    for img in structured_content["images"]:
-        remote_url = img["url"]
-        alt_text   = img["alt"]
-
-        # 2A) Download from Mailchimp
-        try:
-            binary_data = download_image(remote_url)
-        except Exception as e:
-            print(f"Error downloading {remote_url}: {e}")
-            continue
-
-        # 2B) Derive a filename
-        filename = remote_url.split("/")[-1]
-        if not filename:
-            filename = "mailchimp-image.jpg"
-
-        # 2C) Upload to WP
-        try:
-            media_item = upload_to_wp_media(binary_data, filename, alt_text, wp_url, headers)
-        except Exception as e:
-            print(f"Error uploading to WP media: {e}")
-            continue
-
-        # The local media ID + URL
-        media_id = media_item.get("id")
-        local_url = media_item.get("source_url", remote_url)
-
-        # 2D) Build a Gutenberg image block referencing the local WP media item
-        alt_escaped = alt_text.replace('"', '\\"')
-        url_escaped = local_url.replace('"', '\\"')
-
-        # We'll set a default width of 600. You can adjust or remove if you like.
-        image_block = (
-            f'<!-- wp:image {{"id":{media_id},"alt":"{alt_escaped}","url":"{url_escaped}","width":600}} -->'
-            f'<figure class="wp-block-image size-full is-resized">'
-            f'<img src="{url_escaped}" alt="{alt_escaped}" width="600" />'
-            f'</figure>'
-            f'<!-- /wp:image -->'
-        )
-        blocks_html.append(image_block)
-
-    # --- 3) CTA as a button block, if present ---
-    cta = structured_content.get("call_to_action")
-    if cta and cta["url"]:
-        text_escaped = cta["text"].replace('"', '\\"')
-        url_escaped = cta["url"].replace('"', '\\"')
-        button_block = (
-            f'<!-- wp:button -->'
-            f'<div class="wp-block-button">'
-            f'<a class="wp-block-button__link" href="{url_escaped}">{text_escaped}</a>'
-            f'</div>'
-            f'<!-- /wp:button -->'
-        )
-        blocks_html.append(button_block)
-
-    return "\n".join(blocks_html)
-
-
 def send_to_wordpress(structured_content):
     """
-    Create a draft post in WordPress via REST API,
-    uploading images to the Media Library, then referencing them in blocks.
+    Create a WP draft post with:
+      - no content
+      - custom meta fields (newsletter_text_blocks, newsletter_images, newsletter_cta)
+      - images are uploaded to the media library first
     """
     wp_url = os.environ.get('WORDPRESS_URL')
     wp_user = os.environ.get('WORDPRESS_USERNAME')
@@ -239,38 +143,63 @@ def send_to_wordpress(structured_content):
     if not (wp_url and wp_user and wp_pass):
         raise Exception("WordPress environment variables not set properly.")
 
-    # Prepare Basic Auth
-    auth = base64.b64encode(f"{wp_user}:{wp_pass}".encode()).decode()
+    # Auth
+    auth_str = f"{wp_user}:{wp_pass}"
+    auth_b64 = base64.b64encode(auth_str.encode()).decode()
     headers = {
-        "Authorization": f"Basic {auth}"
+        "Authorization": f"Basic {auth_b64}"
     }
 
-    # 1) Build Gutenberg block markup with local images
-    block_markup = build_gutenberg_blocks(structured_content, wp_url, headers)
+    # 1) Upload each image to WP
+    uploaded_images_info = []
+    for img in structured_content["images"]:
+        remote_url = img["url"]
+        alt_text = img["alt"]
+        try:
+            img_data = download_image(remote_url)
+        except Exception as e:
+            print(f"Error downloading {remote_url}: {e}")
+            continue
 
-    # 2) Create the post
+        filename = remote_url.split("/")[-1] or "mailchimp-image.jpg"
+        try:
+            media_item = upload_to_wp_media(img_data, filename, alt_text, wp_url, headers)
+        except Exception as e:
+            print(f"Error uploading to WP media: {e}")
+            continue
+
+        # Store the final WP ID & URL, plus alt text
+        uploaded_images_info.append({
+            "media_id": media_item.get("id"),
+            "url": media_item.get("source_url"),
+            "alt": alt_text
+        })
+
+    # 2) Build meta data
     post_data = {
-        'title': structured_content['title'],
-        'status': 'draft',
-        'content': block_markup
+        "title": structured_content["title"],
+        "status": "draft",
+        "content": "",  # empty main content
+        "meta": {
+            "newsletter_text_blocks": json.dumps(structured_content["text_blocks"]),
+            "newsletter_images": json.dumps(uploaded_images_info),
+            "newsletter_cta": json.dumps(structured_content["call_to_action"])
+        }
     }
 
-    response = requests.post(
+    # 3) Create the draft post
+    post_resp = requests.post(
         f"{wp_url}/wp-json/wp/v2/posts",
         headers={**headers, "Content-Type": "application/json"},
         json=post_data
     )
-    response.raise_for_status()
-    return response.json()
+    post_resp.raise_for_status()
+    return post_resp.json()
 
 
 @app.route('/webhook/mailchimp', methods=['GET','POST','HEAD'])
 def mailchimp_webhook():
-    """
-    Handles Mailchimp webhook validation (GET/HEAD)
-    and incoming campaign notifications (POST).
-    Mailchimp typically sends form-encoded data by default.
-    """
+    """Mailchimp POSTs here when a campaign is sent."""
     if request.method in ['GET', 'HEAD']:
         return "OK", 200
 
@@ -283,13 +212,15 @@ def mailchimp_webhook():
             campaign_id = data.get('data', {}).get('id')
 
         if not campaign_id:
-            return jsonify({"error": "No campaign ID found in payload"}), 400
+            return jsonify({"error": "No campaign ID found"}), 400
 
-        # 1. Fetch the campaign content from Mailchimp
+        # 1) Fetch campaign data from Mailchimp
         campaign_data = get_mailchimp_campaign(campaign_id)
-        # 2. Parse it into structured text_blocks/images/cta
+
+        # 2) Parse out text, images, cta
         structured_content = parse_email_content(campaign_data)
-        # 3. Send to WordPress as Gutenberg blocks + local media
+
+        # 3) Create WP draft: images -> media library, text -> custom fields, content = ""
         wp_response = send_to_wordpress(structured_content)
 
         return jsonify({"status": "success", "wordpress_response": wp_response}), 200

@@ -86,20 +86,60 @@ def parse_email_content(campaign_data):
     return structured
 
 
-def build_gutenberg_blocks(structured_content):
+def download_image(image_url):
+    """Download the remote image bytes from Mailchimp or any URL."""
+    resp = requests.get(image_url)
+    resp.raise_for_status()
+    return resp.content  # raw binary data
+
+
+def upload_to_wp_media(image_binary, filename, alt_text, wp_url, headers):
     """
-    Turn text blocks, images, and CTA into valid Gutenberg block HTML
-    so you can drag them around in the WP editor.
+    Upload the binary image data to the WP Media Library via REST API.
+    Returns the JSON response, including 'id' and 'source_url'.
     """
+    media_url = f"{wp_url}/wp-json/wp/v2/media"
+
+    # We'll guess the content type from the extension, or just default to image/jpeg
+    content_type = "image/jpeg"
+    if filename.lower().endswith(".png"):
+        content_type = "image/png"
+
+    files = {
+        'file': (filename, image_binary, content_type)
+    }
+    data = {
+        'title': filename,
+        'alt_text': alt_text
+    }
+
+    # Must use "files=..." to send multipart/form-data
+    upload_resp = requests.post(media_url, headers=headers, files=files, data=data)
+    upload_resp.raise_for_status()
+    return upload_resp.json()
+
+
+def build_gutenberg_blocks(structured_content, wp_url, headers):
+    """
+    Turn text blocks, images, and CTA into valid Gutenberg block HTML,
+    *uploading each remote image* to WP Media, referencing its local URL/ID.
+    """
+    # --- 1) MERGE ALL PARAGRAPHS INTO ONE BLOCK ---
+    merged_text = []
+    seen = set()
+    for block in structured_content["text_blocks"]:
+        text = block["content"].strip()
+        if not text or text in seen:
+            continue  # skip empty or exact duplicate
+        seen.add(text)
+        merged_text.append(text)
+    big_paragraph = "\n\n".join(merged_text)  # separate paragraphs with double line breaks
+
     blocks_html = []
 
-    # 1) Paragraph blocks
-    for block in structured_content["text_blocks"]:
-        text_escaped = block["content"].replace('"', '\\"')  # escape quotes for JSON
-        # Gutenberg paragraph block markup:
-        # <!-- wp:paragraph -->
-        # <p>Paragraph text</p>
-        # <!-- /wp:paragraph -->
+    # Create a single paragraph block (or multiple if you prefer)
+    if big_paragraph:
+        text_escaped = big_paragraph.replace('"', '\\"')
         paragraph_block = (
             f'<!-- wp:paragraph -->'
             f'<p>{text_escaped}</p>'
@@ -107,32 +147,53 @@ def build_gutenberg_blocks(structured_content):
         )
         blocks_html.append(paragraph_block)
 
-    # 2) Image blocks
+    # --- 2) For each image, upload to WP media, then build local image blocks
     for img in structured_content["images"]:
-        url_escaped = img["url"].replace('"', '\\"')
-        alt_escaped = img["alt"].replace('"', '\\"')
-        # Gutenberg image block markup:
-        # <!-- wp:image {"alt":"ALT","url":"URL"} -->
-        # <figure class="wp-block-image size-full"><img src="URL" alt="ALT"/></figure>
-        # <!-- /wp:image -->
+        remote_url = img["url"]
+        alt_text   = img["alt"]
+
+        # 2A) Download from Mailchimp
+        try:
+            binary_data = download_image(remote_url)
+        except Exception as e:
+            print(f"Error downloading {remote_url}: {e}")
+            continue
+
+        # 2B) Derive a filename
+        filename = remote_url.split("/")[-1]
+        if not filename:
+            filename = "mailchimp-image.jpg"
+
+        # 2C) Upload to WP
+        try:
+            media_item = upload_to_wp_media(binary_data, filename, alt_text, wp_url, headers)
+        except Exception as e:
+            print(f"Error uploading to WP media: {e}")
+            continue
+
+        # The local media ID + URL
+        media_id = media_item.get("id")
+        local_url = media_item.get("source_url", remote_url)
+
+        # 2D) Build a Gutenberg image block referencing the local WP media item
+        alt_escaped = alt_text.replace('"', '\\"')
+        url_escaped = local_url.replace('"', '\\"')
+
+        # We'll set a default width of 600. You can adjust or remove if you like.
         image_block = (
-            f'<!-- wp:image {{"alt":"{alt_escaped}","url":"{url_escaped}"}} -->'
-            f'<figure class="wp-block-image size-full">'
-            f'<img src="{url_escaped}" alt="{alt_escaped}"/>'
+            f'<!-- wp:image {{"id":{media_id},"alt":"{alt_escaped}","url":"{url_escaped}","width":600}} -->'
+            f'<figure class="wp-block-image size-full is-resized">'
+            f'<img src="{url_escaped}" alt="{alt_escaped}" width="600" />'
             f'</figure>'
             f'<!-- /wp:image -->'
         )
         blocks_html.append(image_block)
 
-    # 3) CTA as a button block (if present)
+    # --- 3) CTA as a button block, if present ---
     cta = structured_content.get("call_to_action")
     if cta and cta["url"]:
         text_escaped = cta["text"].replace('"', '\\"')
         url_escaped = cta["url"].replace('"', '\\"')
-        # Gutenberg button block markup:
-        # <!-- wp:button -->
-        # <div class="wp-block-button"><a class="wp-block-button__link" href="URL">CTA Text</a></div>
-        # <!-- /wp:button -->
         button_block = (
             f'<!-- wp:button -->'
             f'<div class="wp-block-button">'
@@ -142,14 +203,13 @@ def build_gutenberg_blocks(structured_content):
         )
         blocks_html.append(button_block)
 
-    # Finally, join everything into one big string
     return "\n".join(blocks_html)
 
 
 def send_to_wordpress(structured_content):
     """
     Create a draft post in WordPress via REST API,
-    but store everything as real Gutenberg blocks in post_content.
+    uploading images to the Media Library, then referencing them in blocks.
     """
     wp_url = os.environ.get('WORDPRESS_URL')
     wp_user = os.environ.get('WORDPRESS_USERNAME')
@@ -158,25 +218,27 @@ def send_to_wordpress(structured_content):
     if not (wp_url and wp_user and wp_pass):
         raise Exception("WordPress environment variables not set properly.")
 
-    # Build Gutenberg block markup from text_blocks, images, CTA
-    block_markup = build_gutenberg_blocks(structured_content)
+    # Prepare Basic Auth
+    auth = base64.b64encode(f"{wp_user}:{wp_pass}".encode()).decode()
+    headers = {
+        "Authorization": f"Basic {auth}"
+    }
 
-    # Put it directly into the 'content' field so it appears in WP
+    # 1) Build Gutenberg block markup with local images
+    block_markup = build_gutenberg_blocks(structured_content, wp_url, headers)
+
+    # 2) Create the post
     post_data = {
         'title': structured_content['title'],
         'status': 'draft',
         'content': block_markup
-        # We can skip the meta fields, or still store them if you want.
     }
 
-    # Basic Auth
-    auth = base64.b64encode(f"{wp_user}:{wp_pass}".encode()).decode()
-    headers = {
-        "Authorization": f"Basic {auth}",
-        "Content-Type": "application/json"
-    }
-
-    response = requests.post(f"{wp_url}/wp-json/wp/v2/posts", headers=headers, json=post_data)
+    response = requests.post(
+        f"{wp_url}/wp-json/wp/v2/posts",
+        headers={**headers, "Content-Type": "application/json"},
+        json=post_data
+    )
     response.raise_for_status()
     return response.json()
 
@@ -206,7 +268,7 @@ def mailchimp_webhook():
         campaign_data = get_mailchimp_campaign(campaign_id)
         # 2. Parse it into structured text_blocks/images/cta
         structured_content = parse_email_content(campaign_data)
-        # 3. Send to WordPress as Gutenberg blocks
+        # 3. Send to WordPress as Gutenberg blocks + local media
         wp_response = send_to_wordpress(structured_content)
 
         return jsonify({"status": "success", "wordpress_response": wp_response}), 200

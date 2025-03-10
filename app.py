@@ -40,8 +40,13 @@ def get_mailchimp_campaign(campaign_id):
     content_json['subject_line'] = subject_line
     return content_json
 
+
 def parse_email_content(campaign_data):
-    """Extract structured content from the campaign HTML."""
+    """
+    Extract structured content from the campaign HTML.
+    Now we grab text from all <p> and <li> elements
+    so we don't miss paragraphs outside td.mcnTextContent.
+    """
     html = campaign_data.get('html', '')
     soup = BeautifulSoup(html, 'html.parser')
 
@@ -52,16 +57,21 @@ def parse_email_content(campaign_data):
         'call_to_action': None
     }
 
-    # Example parsing paragraphs inside .mcnTextContent
-    for paragraph in soup.select('td.mcnTextContent p'):
-        text = paragraph.get_text(strip=True)
-        if text:
-            structured['text_blocks'].append({
-                'type': 'paragraph',
-                'content': text
-            })
+    # 1) Grab text from ALL <p> and <li>
+    for elem in soup.find_all(['p', 'li']):
+        text = elem.get_text(strip=True)
+        if not text:
+            continue  # skip empty
+        # (Optional) filter out disclaimers or subscription footers if needed:
+        # if 'unsubscribe' in text.lower() or 'preferences' in text.lower():
+        #     continue
 
-    # Example: parse images, skipping logos/icons
+        structured['text_blocks'].append({
+            'type': 'paragraph',
+            'content': text
+        })
+
+    # 2) Parse images, skipping logos/icons
     for img in soup.select('img'):
         src = img.get('src')
         alt = img.get('alt', '')
@@ -71,7 +81,7 @@ def parse_email_content(campaign_data):
                 'alt': alt
             })
 
-    # Example: parse CTA button
+    # 3) Parse a CTA button if it exists
     cta = soup.select_one('a.mcnButton')
     if cta:
         structured['call_to_action'] = {
@@ -80,6 +90,7 @@ def parse_email_content(campaign_data):
         }
 
     return structured
+
 
 def send_to_wordpress(structured_content):
     """Create a draft post in WordPress via REST API."""
@@ -112,6 +123,7 @@ def send_to_wordpress(structured_content):
     response.raise_for_status()
     return response.json()
 
+
 @app.route('/webhook/mailchimp', methods=['GET','POST','HEAD'])
 def mailchimp_webhook():
     """
@@ -128,7 +140,6 @@ def mailchimp_webhook():
         
         # Mailchimp usually sends data in form-encoded format:
         if request.form:
-            # E.g. request.form might have keys like "type", "data[id]", "fired_at", etc.
             campaign_id = request.form.get('data[id]')
         else:
             # If JSON is ever used, fallback to parsing JSON:
@@ -153,6 +164,7 @@ def mailchimp_webhook():
     except Exception as e:
         print(f"Error: {e}")
         return jsonify({"error": str(e)}), 500
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))

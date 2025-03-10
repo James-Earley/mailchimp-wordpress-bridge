@@ -112,15 +112,19 @@ def send_to_wordpress(structured_content):
     response.raise_for_status()
     return response.json()
 
-@app.route('/webhook/mailchimp', methods=['POST'])
+@app.route('/webhook/mailchimp', methods=['GET','POST','HEAD'])
 def mailchimp_webhook():
+    # Respond to GET / HEAD requests so Mailchimp can verify the endpoint:
+    if request.method in ['GET', 'HEAD']:
+        return "OK", 200
+
     try:
         data = request.json
-        campaign_id = data.get('data', {}).get('id')  # According to Mailchimp’s typical payload
+        campaign_id = data.get('data', {}).get('id')  # from Mailchimp's payload
         if not campaign_id:
             return jsonify({"error": "No campaign ID found in payload"}), 400
 
-        # 1. Fetch campaign content from Mailchimp
+        # 1. Fetch the campaign content from Mailchimp
         campaign_data = get_mailchimp_campaign(campaign_id)
         # 2. Parse it
         structured_content = parse_email_content(campaign_data)

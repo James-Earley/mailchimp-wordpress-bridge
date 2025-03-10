@@ -42,10 +42,6 @@ def get_mailchimp_campaign(campaign_id):
 
 
 def parse_email_content(campaign_data):
-    """
-    Extract structured content from the campaign HTML.
-    Broad approach: gather text from all <p> and <li>, gather images, optionally CTA.
-    """
     html = campaign_data.get('html', '')
     soup = BeautifulSoup(html, 'html.parser')
 
@@ -56,7 +52,7 @@ def parse_email_content(campaign_data):
         'call_to_action': None
     }
 
-    # Grab paragraphs + list items
+    # Grab paragraphs & list items
     for elem in soup.find_all(['p', 'li']):
         text = elem.get_text(strip=True)
         if text:
@@ -65,17 +61,41 @@ def parse_email_content(campaign_data):
                 'content': text
             })
 
-    # Grab images
-    for img in soup.select('img'):
+    # Grab all images initially
+    all_imgs = soup.select('img')
+
+    # 1) Filter out any that mention "logo" or "signature" in alt or src
+    filtered_images = []
+    for img in all_imgs:
         src = img.get('src')
         alt = img.get('alt', '')
-        if src and not any(keyword in src.lower() for keyword in ['logo', 'icon', 'footer']):
-            structured['images'].append({
-                'url': src,
-                'alt': alt
-            })
+        if not src:
+            continue
 
-    # Optional: parse CTA if there's a specific button class
+        src_lower = src.lower()
+        alt_lower = alt.lower()
+
+        # Skip if "logo" or "signature" in either alt or src
+        if "logo" in src_lower or "logo" in alt_lower or "signature" in src_lower or "signature" in alt_lower:
+            continue
+
+        filtered_images.append(img)
+
+    # 2) Exclude the first & last from that filtered list
+    # (only if we have at least 3 images; otherwise slicing might remove everything)
+    if len(filtered_images) > 2:
+        filtered_images = filtered_images[1:-1]
+
+    # Now store the final images in structured_content
+    for img in filtered_images:
+        src = img.get('src')
+        alt = img.get('alt', '')
+        structured['images'].append({
+            'url': src,
+            'alt': alt
+        })
+
+    # Finally, parse CTA if needed
     cta = soup.select_one('a.mcnButton')
     if cta:
         structured['call_to_action'] = {
@@ -84,6 +104,7 @@ def parse_email_content(campaign_data):
         }
 
     return structured
+
 
 
 def download_image(image_url):

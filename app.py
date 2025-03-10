@@ -114,13 +114,27 @@ def send_to_wordpress(structured_content):
 
 @app.route('/webhook/mailchimp', methods=['GET','POST','HEAD'])
 def mailchimp_webhook():
-    # Respond to GET / HEAD requests so Mailchimp can verify the endpoint:
+    """
+    Handles Mailchimp webhook validation (GET/HEAD)
+    and incoming campaign notifications (POST).
+    Mailchimp typically sends form-encoded data by default.
+    """
+    # Respond to GET/HEAD so Mailchimp can verify the endpoint:
     if request.method in ['GET', 'HEAD']:
         return "OK", 200
 
     try:
-        data = request.json
-        campaign_id = data.get('data', {}).get('id')  # from Mailchimp's payload
+        campaign_id = None
+        
+        # Mailchimp usually sends data in form-encoded format:
+        if request.form:
+            # E.g. request.form might have keys like "type", "data[id]", "fired_at", etc.
+            campaign_id = request.form.get('data[id]')
+        else:
+            # If JSON is ever used, fallback to parsing JSON:
+            data = request.get_json(silent=True) or {}
+            campaign_id = data.get('data', {}).get('id')
+
         if not campaign_id:
             return jsonify({"error": "No campaign ID found in payload"}), 400
 

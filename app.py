@@ -8,7 +8,6 @@ from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 
-
 def get_mailchimp_campaign(campaign_id):
     """Fetch campaign content from Mailchimp API."""
     api_key = os.environ.get('MAILCHIMP_API_KEY')
@@ -49,20 +48,20 @@ def parse_email_content(campaign_data):
     3. Merge consecutive paragraphs into one block.
     4. Label headings with "level"=1..6.
     5. Skip unwanted images; gather the rest.
-    6. Capture CTA if there's an .mcnButton.
+    6. Then exclude top & bottom image if there's more than 2 total.
+    7. Capture CTA if there's an .mcnButton.
     """
     html = campaign_data.get("html", "")
     soup = BeautifulSoup(html, "html.parser")
 
-    # We'll store final text blocks in `structured["text_blocks"]`.
     structured = {
         "title": campaign_data.get("subject_line", ""),
-        "text_blocks": [],    # headings, paragraphs, lists
+        "text_blocks": [],
         "images": [],
         "call_to_action": None
     }
 
-    # 1) Gather headings, paragraphs, lists in DOM order
+    # 1) Gather headings, paragraphs, and lists in DOM order
     node_list = soup.find_all(["h1","h2","h3","h4","h5","h6","p","ul","ol"])
     raw_blocks = []
 
@@ -71,7 +70,7 @@ def parse_email_content(campaign_data):
         if tag in ["h1","h2","h3","h4","h5","h6"]:
             text = node.get_text(strip=True)
             if text:
-                level = int(tag[-1])  # e.g. h2 -> level = 2
+                level = int(tag[-1])  # e.g. h2 -> level=2
                 raw_blocks.append({
                     "type": "header",
                     "level": level,
@@ -85,7 +84,7 @@ def parse_email_content(campaign_data):
                     "content": text
                 })
         elif tag in ["ul","ol"]:
-            # Build a single "list" block with <li> children
+            # Build a single "list" block containing all <li>
             items = []
             lis = node.find_all("li", recursive=False)
             for li in lis:
@@ -111,10 +110,9 @@ def parse_email_content(campaign_data):
                 continue
         merged.append(block)
 
-    # These text blocks go into structured["text_blocks"]
     structured["text_blocks"] = merged
 
-    # 3) Filter images
+    # 3) Filter images by skipping any with certain keywords
     unwanted = ["logo","signature","facebook","twitter","instagram","social","footer"]
     all_imgs = soup.select("img")
     filtered_images = []
@@ -125,14 +123,18 @@ def parse_email_content(campaign_data):
             continue
         if any(uw in src for uw in unwanted) or any(uw in alt for uw in unwanted):
             continue
-        # Keep it
         filtered_images.append({
             "url": img.get("src"),
             "alt": img.get("alt","")
         })
+
+    # 4) Exclude the top & bottom image if there's more than 2 total
+    if len(filtered_images) > 2:
+        filtered_images = filtered_images[1:-1]
+
     structured["images"] = filtered_images
 
-    # 4) CTA from .mcnButton
+    # 5) CTA from .mcnButton
     cta = soup.select_one("a.mcnButton")
     if cta:
         structured["call_to_action"] = {
@@ -154,7 +156,7 @@ def upload_to_wp_media(image_binary, filename, alt_text, wp_url, headers):
     """Upload image to WP Media Library. Return JSON with 'id','source_url'."""
     media_url = f"{wp_url}/wp-json/wp/v2/media"
 
-    # Guess content type
+    # Guess the content type from extension
     content_type = "image/jpeg"
     if filename.lower().endswith(".png"):
         content_type = "image/png"
@@ -174,7 +176,7 @@ def upload_to_wp_media(image_binary, filename, alt_text, wp_url, headers):
 
 def send_to_wordpress(structured_content):
     """
-    Create WP draft with:
+    Create a WP draft with:
       - no main content
       - meta fields: newsletter_text_blocks, newsletter_images, newsletter_cta
       - images are uploaded to media first.
@@ -198,14 +200,14 @@ def send_to_wordpress(structured_content):
         remote_url = img["url"]
         alt_text   = img["alt"]
         try:
-            data = download_image(remote_url)
+            img_data = download_image(remote_url)
         except Exception as e:
             print(f"Error downloading {remote_url}: {e}")
             continue
 
         filename = remote_url.split("/")[-1] or "mailchimp-image.jpg"
         try:
-            media_item = upload_to_wp_media(data, filename, alt_text, wp_url, headers)
+            media_item = upload_to_wp_media(img_data, filename, alt_text, wp_url, headers)
         except Exception as e:
             print(f"Error uploading to WP media: {e}")
             continue
@@ -222,7 +224,6 @@ def send_to_wordpress(structured_content):
         "status": "draft",
         "content": "",  # empty
         "meta": {
-            # We'll store text_blocks, images, call_to_action
             "newsletter_text_blocks": json.dumps(structured_content["text_blocks"]),
             "newsletter_images": json.dumps(uploaded_images),
             "newsletter_cta": json.dumps(structured_content["call_to_action"])
@@ -252,7 +253,10 @@ def mailchimp_webhook():
     print("JSON data:", request.json)
 
     if request.method in ['GET', 'HEAD']:
-        return "OK", 200
+        return "OK", 200, {'Content-Type': 'text/plain'}
+    
+    print("Content-Type:", request.headers.get('Content-Type'))
+    print("Method:", request.method)
 
     try:
         if request.form:

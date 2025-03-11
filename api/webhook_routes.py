@@ -67,7 +67,8 @@ def _process_campaign(campaign_id):
         structured_content["title"],
         structured_content["text_blocks"],
         uploaded_images,
-        structured_content["call_to_action"]
+        structured_content["call_to_action"],
+        structured_content.get("embedded_links", [])
     )
     
     return jsonify({

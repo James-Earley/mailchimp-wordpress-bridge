@@ -11,7 +11,8 @@ class ContentProcessor:
         3. Merge consecutive paragraphs into one block
         4. Label headings with "level"=1..6
         5. Extract content images using smart filtering logic
-        6. Capture CTA if there's an .mcnButton
+        6. Capture CTAs with improved detection logic
+        7. Extract useful embedded links (excluding generic/tracking links)
         """
         html = campaign_data.get("html", "")
         soup = BeautifulSoup(html, "html.parser")
@@ -20,7 +21,8 @@ class ContentProcessor:
             "title": campaign_data.get("subject_line", ""),
             "text_blocks": [],
             "images": [],
-            "call_to_action": None
+            "call_to_action": None,
+            "embedded_links": []  # New feature for embedded links
         }
 
         # Extract text blocks (headings, paragraphs, lists)
@@ -29,8 +31,11 @@ class ContentProcessor:
         # Extract and filter images with smart logic
         structured["images"] = self._extract_content_images(soup)
         
-        # Extract call to action
+        # Extract call to action with improved detection
         structured["call_to_action"] = self._extract_cta(soup)
+        
+        # Extract embedded user links (new feature)
+        structured["embedded_links"] = self._extract_embedded_links(soup)
 
         return structured
     
@@ -297,11 +302,258 @@ class ContentProcessor:
         return (at_bottom and (has_footer_keyword or in_footer_container or is_small))
     
     def _extract_cta(self, soup):
-        """Extract call to action button from the HTML."""
-        cta = soup.select_one("a.mcnButton")
-        if cta:
-            return {
-                "text": cta.get_text(strip=True),
-                "url": cta.get("href","")
-            }
+        """
+        Extract call to action buttons from the HTML with improved detection.
+        Returns the primary CTA or the first CTA found.
+        """
+        # Look for possible CTA elements with various button classes and attributes
+        button_classes = [
+            "mcnButton",                # Standard Mailchimp button
+            "button",                   # Generic button class
+            "btn",                      # Bootstrap-style button
+            "cta",                      # Explicit CTA class
+            "action",                   # Action button
+            "primary-button",           # Primary button variant
+            "mc-button"                 # Another Mailchimp variant
+        ]
+        
+        # Try class-based button selectors (combine with CSS OR selector)
+        class_selector = ", ".join(f"a.{cls}" for cls in button_classes)
+        class_buttons = soup.select(class_selector)
+        
+        # Try attribute and style-based button detection
+        attribute_buttons = []
+        
+        # Look for elements with button-like styling
+        for a_tag in soup.find_all('a'):
+            # Skip if we already found it via class
+            if a_tag in class_buttons:
+                continue
+                
+            # Check for button-like styling in style attribute
+            style = a_tag.get('style', '').lower()
+            if any(s in style for s in ['padding', 'border-radius', 'background']):
+                if any(s in style for s in ['block', 'inline-block', 'center']):
+                    attribute_buttons.append(a_tag)
+                    continue
+            
+            # Check for button-like parent elements
+            parent = a_tag.parent
+            if parent and parent.name == 'td':
+                parent_style = parent.get('style', '').lower()
+                if any(s in parent_style for s in ['padding', 'border-radius', 'background', 'center']):
+                    attribute_buttons.append(a_tag)
+                    continue
+            
+            # Check for role attribute
+            if a_tag.get('role') == 'button':
+                attribute_buttons.append(a_tag)
+                continue
+        
+        # Combine all found buttons
+        all_buttons = class_buttons + attribute_buttons
+        
+        if not all_buttons:
+            return None
+            
+        # Process all buttons to prioritize them
+        button_data = []
+        for btn in all_buttons:
+            text = btn.get_text(strip=True)
+            url = btn.get("href", "")
+            
+            # Skip obvious non-CTA links (social, unsubscribe, etc.)
+            if self._is_utility_link(text, url):
+                continue
+                
+            # Calculate priority score
+            score = self._calculate_cta_priority(btn, text)
+            
+            button_data.append({
+                "text": text,
+                "url": url,
+                "priority_score": score
+            })
+        
+        # Sort by priority and take the highest
+        if button_data:
+            sorted_buttons = sorted(button_data, key=lambda x: x["priority_score"], reverse=True)
+            result = sorted_buttons[0]
+            # Remove the score from final result
+            del result["priority_score"]
+            return result
+            
         return None
+
+    def _calculate_cta_priority(self, button, text):
+        """Calculate a priority score for a potential CTA button."""
+        score = 0
+        
+        # Prioritize buttons with explicit CTA classes
+        cls = ' '.join(button.get('class', []))
+        if any(c in cls.lower() for c in ['cta', 'action', 'primary', 'main']):
+            score += 10
+        
+        # Prioritize based on common CTA text patterns
+        cta_phrases = ['learn more', 'read more', 'sign up', 'register', 'buy now', 
+                       'get started', 'join', 'subscribe', 'download', 'shop', 
+                       'view', 'click here', 'discover']
+        
+        lower_text = text.lower()
+        if any(phrase in lower_text for phrase in cta_phrases):
+            score += 5
+            
+        # Prioritize standalone buttons with short text (typical for CTAs)
+        if len(text) < 30:
+            score += 3
+            
+        # Check for visual prominence indicators
+        style = button.get('style', '').lower()
+        if 'bold' in style or 'weight' in style:
+            score += 2
+        if any(color in style for color in ['background', 'bg', 'color']):
+            score += 2
+            
+        # Check parent for centering (centered buttons are often CTAs)
+        parent = button.parent
+        if parent:
+            parent_style = parent.get('style', '').lower()
+            parent_class = ' '.join(parent.get('class', []))
+            if any(align in parent_style or align in parent_class 
+                   for align in ['center', 'align', 'margin:auto']):
+                score += 2
+                
+        return score
+    
+    def _is_utility_link(self, text, url):
+        """Check if a link is a utility link rather than a content link."""
+        utility_patterns = [
+            # Social media
+            'facebook.com', 'twitter.com', 'instagram.com', 'linkedin.com',
+            'youtube.com', 'pinterest.com', 'tiktok.com',
+            
+            # Mailchimp and email utility links
+            'mailchimp.com', 'list-manage.com', 'forward to a friend', 
+            'unsubscribe', 'preferences', 'view in browser',
+            
+            # Common site utility links
+            'privacy policy', 'terms', 'contact us', 'help', 'faq'
+        ]
+        
+        lower_text = text.lower()
+        lower_url = url.lower()
+        
+        return any(pattern in lower_text or pattern in lower_url 
+                  for pattern in utility_patterns)
+    
+    def _extract_embedded_links(self, soup):
+        """
+        Extract embedded user links from the email content.
+        Excludes utility links, tracking links, and other non-content links.
+        """
+        # Find all links in content areas (typical for text content)
+        content_containers = [
+            'mcnTextContent',           # Mailchimp text content block
+            'mcnTextContentContainer',  # Mailchimp text container
+            'contentContainer',         # Generic content container
+            'bodyContainer',            # Email body container
+            'contentBlock',             # Generic content block
+        ]
+        
+        # Combined selector for content areas
+        content_selector = ", ".join(f".{cls}" for cls in content_containers)
+        content_areas = soup.select(content_selector)
+        
+        # If we found content areas, look for links in them
+        links_in_content = []
+        if content_areas:
+            for area in content_areas:
+                links_in_content.extend(area.find_all('a'))
+        else:
+            # If we couldn't find content areas, take all links
+            # We'll filter them later
+            links_in_content = soup.find_all('a')
+        
+        # Process and filter the links
+        user_links = []
+        for link in links_in_content:
+            text = link.get_text(strip=True)
+            url = link.get('href', '')
+            
+            # Skip empty links
+            if not text or not url:
+                continue
+                
+            # Skip utility and known non-content links
+            if self._is_utility_link(text, url):
+                continue
+                
+            # Skip tracking links and internal anchors
+            if self._is_tracking_or_anchor_link(url):
+                continue
+                
+            # Skip if it's likely a button (already handled in CTA)
+            if self._is_likely_button(link):
+                continue
+                
+            # Add the valid user link
+            user_links.append({
+                "text": text,
+                "url": url
+            })
+        
+        # Remove duplicates (same URL)
+        unique_links = []
+        seen_urls = set()
+        
+        for link in user_links:
+            url = link["url"]
+            if url not in seen_urls:
+                seen_urls.add(url)
+                unique_links.append(link)
+        
+        return unique_links
+    
+    def _is_tracking_or_anchor_link(self, url):
+        """Check if a URL is a tracking link or internal anchor."""
+        # Check for tracking pixels or empty URLs
+        if not url or url == '#' or url.startswith('javascript:'):
+            return True
+            
+        # Check for internal anchors
+        if url.startswith('#'):
+            return True
+            
+        # Check for common tracking domains
+        tracking_domains = [
+            'doubleclick.net', 'google-analytics.com', 'mailchimp.com/track',
+            'list-manage.com/track', 'analytics', 'pixel', 'beacon'
+        ]
+        
+        lower_url = url.lower()
+        return any(domain in lower_url for domain in tracking_domains)
+    
+    def _is_likely_button(self, link):
+        """Check if a link is likely to be a button rather than a text link."""
+        # Check classes for button indicators
+        cls = ' '.join(link.get('class', []))
+        if any(btn in cls.lower() for btn in ['button', 'btn', 'cta']):
+            return True
+            
+        # Check style for button-like properties
+        style = link.get('style', '').lower()
+        if any(prop in style for prop in ['padding:', 'background-color:', 'border-radius:']):
+            return True
+            
+        # Check for role attribute
+        if link.get('role') == 'button':
+            return True
+            
+        # Check parent elements for button containers
+        parent = link.parent
+        if parent:
+            parent_cls = ' '.join(parent.get('class', []))
+            if any(btn in parent_cls.lower() for btn in ['button', 'btn', 'cta']):
+                return True
+        
+        return False

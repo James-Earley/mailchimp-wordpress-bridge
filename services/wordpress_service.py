@@ -1,8 +1,8 @@
 import base64
 import json
 import requests
-from .. import config
-from ..utils.image_utils import ImageUtils
+import config  
+from utils.image_utils import ImageUtils  
 
 class WordPressService:
     def __init__(self):

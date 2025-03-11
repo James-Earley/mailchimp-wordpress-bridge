@@ -1,6 +1,6 @@
 import base64
 import requests
-from .. import config
+import config
 
 class MailchimpService:
     def __init__(self):

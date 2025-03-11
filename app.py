@@ -1,6 +1,7 @@
+import os
 from flask import Flask
 from api.webhook_routes import webhook_bp
-from config import PORT, validate_config
+from config import validate_config, PORT
 
 def create_app():
     """Create and configure the Flask application."""
@@ -20,10 +21,13 @@ def create_app():
     
     return app
 
+# Create the app
+app = create_app()
+
+# This is for running the app locally
 if __name__ == '__main__':
     # Validate configuration on startup
     validate_config()
     
-    # Create and run the app
-    app = create_app()
+    # Run the app
     app.run(host='0.0.0.0', port=PORT)

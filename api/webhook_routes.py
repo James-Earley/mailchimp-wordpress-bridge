@@ -1,7 +1,7 @@
 from flask import Blueprint, request, jsonify, Response
-from ..services.mailchimp_service import MailchimpService
-from ..services.wordpress_service import WordPressService
-from ..processors.content_processor import ContentProcessor
+from services.mailchimp_service import MailchimpService  
+from services.wordpress_service import WordPressService  
+from processors.content_processor import ContentProcessor  
 
 # Create Blueprint
 webhook_bp = Blueprint('webhook', __name__, url_prefix='/webhook')

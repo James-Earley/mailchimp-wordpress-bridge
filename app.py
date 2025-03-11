@@ -8,6 +8,7 @@ from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 
+
 def get_mailchimp_campaign(campaign_id):
     """Fetch campaign content from Mailchimp API."""
     api_key = os.environ.get('MAILCHIMP_API_KEY')
@@ -43,44 +44,39 @@ def get_mailchimp_campaign(campaign_id):
 
 def parse_email_content(campaign_data):
     """
-    1. Gather heading(h1..h6), paragraph(p), and lists(ul/ol).
+    1. Gather headings (h1..h6), paragraphs (p), lists (ul/ol) in DOM order.
     2. For each list, create a single "list" block with all <li>.
-    3. Merge consecutive paragraph blocks.
-    4. Label headings with "level" = 1..6.
-    5. Skip unwanted images; gather others.
-    6. Capture CTA from .mcnButton if present.
+    3. Merge consecutive paragraphs into one block.
+    4. Label headings with "level"=1..6.
+    5. Skip unwanted images; gather the rest.
+    6. Capture CTA if there's an .mcnButton.
     """
-    from bs4 import BeautifulSoup
-
     html = campaign_data.get("html", "")
     soup = BeautifulSoup(html, "html.parser")
 
+    # We'll store final text blocks in `structured["text_blocks"]`.
     structured = {
         "title": campaign_data.get("subject_line", ""),
-        "blocks": [],      # text-based blocks (headings, paragraphs, lists)
-        "images": [],      # filtered images
+        "text_blocks": [],    # headings, paragraphs, lists
+        "images": [],
         "call_to_action": None
     }
 
-    # --- 1) GATHER HEADINGS, PARAGRAPHS, LISTS IN ORDER ---
-    # We'll look for h1..h6, p, ul, ol in the DOM sequence
+    # 1) Gather headings, paragraphs, lists in DOM order
     node_list = soup.find_all(["h1","h2","h3","h4","h5","h6","p","ul","ol"])
     raw_blocks = []
 
     for node in node_list:
         tag = node.name.lower()
-
-        # Get text for headings/paragraph merges
         if tag in ["h1","h2","h3","h4","h5","h6"]:
             text = node.get_text(strip=True)
             if text:
-                level = int(tag[-1])  # h2 -> level 2, etc.
+                level = int(tag[-1])  # e.g. h2 -> level = 2
                 raw_blocks.append({
                     "type": "header",
                     "level": level,
                     "content": text
                 })
-
         elif tag == "p":
             text = node.get_text(strip=True)
             if text:
@@ -88,18 +84,14 @@ def parse_email_content(campaign_data):
                     "type": "paragraph",
                     "content": text
                 })
-
         elif tag in ["ul","ol"]:
-            # Build a single "list" block with the <li> children
+            # Build a single "list" block with <li> children
             items = []
             lis = node.find_all("li", recursive=False)
-            # (recursive=False ensures we only get the direct <li> in this list,
-            #  not nested lists if any.)
             for li in lis:
                 li_text = li.get_text(strip=True)
                 if li_text:
                     items.append(li_text)
-
             if items:
                 style = "ordered" if tag == "ol" else "unordered"
                 raw_blocks.append({
@@ -108,42 +100,39 @@ def parse_email_content(campaign_data):
                     "items": items
                 })
 
-    # --- 2) MERGE CONSECUTIVE PARAGRAPHS ---
-    merged_blocks = []
+    # 2) Merge consecutive paragraph blocks
+    merged = []
     for block in raw_blocks:
-        if block["type"] == "paragraph" and merged_blocks:
-            last = merged_blocks[-1]
+        if block["type"] == "paragraph" and merged:
+            last = merged[-1]
             if last["type"] == "paragraph":
-                # Combine them with a blank line in between
+                # Merge them with a blank line
                 last["content"] += "\n\n" + block["content"]
                 continue
-        # Otherwise, push it as a new block
-        merged_blocks.append(block)
+        merged.append(block)
 
-    structured["blocks"] = merged_blocks
+    # These text blocks go into structured["text_blocks"]
+    structured["text_blocks"] = merged
 
-    # --- 3) PARSE IMAGES, SKIP LOGO/SOCIAL/SIGNATURE ---
+    # 3) Filter images
     unwanted = ["logo","signature","facebook","twitter","instagram","social","footer"]
     all_imgs = soup.select("img")
     filtered_images = []
     for img in all_imgs:
         src = (img.get("src") or "").lower()
         alt = (img.get("alt") or "").lower()
-
         if not src:
             continue
         if any(uw in src for uw in unwanted) or any(uw in alt for uw in unwanted):
             continue
-
         # Keep it
         filtered_images.append({
             "url": img.get("src"),
             "alt": img.get("alt","")
         })
-
     structured["images"] = filtered_images
 
-    # --- 4) CTA FROM .mcnButton ---
+    # 4) CTA from .mcnButton
     cta = soup.select_one("a.mcnButton")
     if cta:
         structured["call_to_action"] = {
@@ -155,19 +144,17 @@ def parse_email_content(campaign_data):
 
 
 def download_image(image_url):
-    """Download the remote image bytes."""
+    """Download remote image bytes."""
     resp = requests.get(image_url)
     resp.raise_for_status()
     return resp.content
 
 
 def upload_to_wp_media(image_binary, filename, alt_text, wp_url, headers):
-    """
-    Upload image data to WP Media Library. Return JSON (including 'id', 'source_url').
-    """
+    """Upload image to WP Media Library. Return JSON with 'id','source_url'."""
     media_url = f"{wp_url}/wp-json/wp/v2/media"
 
-    # Guess content type from extension
+    # Guess content type
     content_type = "image/jpeg"
     if filename.lower().endswith(".png"):
         content_type = "image/png"
@@ -180,17 +167,17 @@ def upload_to_wp_media(image_binary, filename, alt_text, wp_url, headers):
         'alt_text': alt_text
     }
 
-    upload_resp = requests.post(media_url, headers=headers, files=files, data=data)
-    upload_resp.raise_for_status()
-    return upload_resp.json()
+    resp = requests.post(media_url, headers=headers, files=files, data=data)
+    resp.raise_for_status()
+    return resp.json()
 
 
 def send_to_wordpress(structured_content):
     """
-    Create a WP draft post with:
-      - no content
-      - custom meta fields (newsletter_text_blocks, newsletter_images, newsletter_cta)
-      - images are uploaded to the media library first
+    Create WP draft with:
+      - no main content
+      - meta fields: newsletter_text_blocks, newsletter_images, newsletter_cta
+      - images are uploaded to media first.
     """
     wp_url = os.environ.get('WORDPRESS_URL')
     wp_user = os.environ.get('WORDPRESS_USERNAME')
@@ -199,68 +186,69 @@ def send_to_wordpress(structured_content):
     if not (wp_url and wp_user and wp_pass):
         raise Exception("WordPress environment variables not set properly.")
 
-    # Auth
     auth_str = f"{wp_user}:{wp_pass}"
     auth_b64 = base64.b64encode(auth_str.encode()).decode()
     headers = {
         "Authorization": f"Basic {auth_b64}"
     }
 
-    # 1) Upload each image to WP
-    uploaded_images_info = []
+    # Upload images
+    uploaded_images = []
     for img in structured_content["images"]:
         remote_url = img["url"]
-        alt_text = img["alt"]
+        alt_text   = img["alt"]
         try:
-            img_data = download_image(remote_url)
+            data = download_image(remote_url)
         except Exception as e:
             print(f"Error downloading {remote_url}: {e}")
             continue
 
         filename = remote_url.split("/")[-1] or "mailchimp-image.jpg"
         try:
-            media_item = upload_to_wp_media(img_data, filename, alt_text, wp_url, headers)
+            media_item = upload_to_wp_media(data, filename, alt_text, wp_url, headers)
         except Exception as e:
             print(f"Error uploading to WP media: {e}")
             continue
 
-        # Store the final WP ID & URL, plus alt text
-        uploaded_images_info.append({
+        uploaded_images.append({
             "media_id": media_item.get("id"),
             "url": media_item.get("source_url"),
             "alt": alt_text
         })
 
-    # 2) Build meta data
+    # Build post data
     post_data = {
         "title": structured_content["title"],
         "status": "draft",
-        "content": "",  # empty main content
+        "content": "",  # empty
         "meta": {
+            # We'll store text_blocks, images, call_to_action
             "newsletter_text_blocks": json.dumps(structured_content["text_blocks"]),
-            "newsletter_images": json.dumps(uploaded_images_info),
+            "newsletter_images": json.dumps(uploaded_images),
             "newsletter_cta": json.dumps(structured_content["call_to_action"])
         }
     }
 
-    # 3) Create the draft post
-    post_resp = requests.post(
+    # Create draft post
+    resp = requests.post(
         f"{wp_url}/wp-json/wp/v2/posts",
         headers={**headers, "Content-Type": "application/json"},
         json=post_data
     )
-    post_resp.raise_for_status()
-    return post_resp.json()
+    resp.raise_for_status()
+    return resp.json()
 
 
 @app.route('/webhook/mailchimp', methods=['GET','POST','HEAD'])
 def mailchimp_webhook():
-    """Mailchimp POSTs here when a campaign is sent."""
+    """
+    Mailchimp calls this with form-encoded data when a campaign is sent.
+    We'll parse, upload images, store as WP draft with custom fields.
+    """
     if request.method in ['GET', 'HEAD']:
         return "OK", 200
 
     try:
-        campaign_id = None
         if request.form:
             campaign_id = request.form.get('data[id]')
         else:
@@ -270,15 +258,12 @@ def mailchimp_webhook():
         if not campaign_id:
             return jsonify({"error": "No campaign ID found"}), 400
 
-        # 1) Fetch campaign data from Mailchimp
+        # Fetch & parse
         campaign_data = get_mailchimp_campaign(campaign_id)
-
-        # 2) Parse out text, images, cta
         structured_content = parse_email_content(campaign_data)
 
-        # 3) Create WP draft: images -> media library, text -> custom fields, content = ""
+        # Send to WP
         wp_response = send_to_wordpress(structured_content)
-
         return jsonify({"status": "success", "wordpress_response": wp_response}), 200
 
     except Exception as e:

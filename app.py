@@ -2,8 +2,7 @@ import os
 import base64
 import requests
 import json
-
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from bs4 import BeautifulSoup
 
 app = Flask(__name__)
@@ -242,21 +241,19 @@ def send_to_wordpress(structured_content):
 
 @app.route('/webhook/mailchimp', methods=['GET','POST','HEAD'])
 def mailchimp_webhook():
-    """
-    Mailchimp calls this with form-encoded data when a campaign is sent.
-    We'll parse, upload images, store as WP draft with custom fields.
-    """
-
     print(">>> MAILCHIMP WEBHOOK CALLED!")
     print("Method is:", request.method)
-    print("Form data:", request.form)
-    print("JSON data:", request.json)
-
-    if request.method in ['GET', 'HEAD']:
-        return "OK", 200, {'Content-Type': 'text/plain'}
     
+    # Handle GET/HEAD requests from Mailchimp validator
+    if request.method in ['GET', 'HEAD']:
+        return Response("OK", status=200, mimetype="text/plain")
+    
+    # Debug incoming request
     print("Content-Type:", request.headers.get('Content-Type'))
-    print("Method:", request.method)
+    print("Form data:", request.form)
+    print("JSON data:", request.get_json(silent=True))
+    
+
 
     try:
         if request.form:

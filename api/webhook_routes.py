@@ -1,3 +1,4 @@
+from threading import Thread
 from flask import Blueprint, request, jsonify, Response
 from services.mailchimp_service import MailchimpService  
 from services.wordpress_service import WordPressService  
@@ -36,8 +37,12 @@ def mailchimp_webhook():
         if not campaign_id:
             return jsonify({"error": "No campaign ID found"}), 400
 
-        # Process the campaign
-        return _process_campaign(campaign_id)
+        thread = Thread(target=_process_campaign_async, args=(campaign_id,))
+        thread.daemon = True
+        thread.start()
+        
+        print(f"Campaign {campaign_id} queued for processing")
+        return jsonify({"status": "queued", "campaign_id": campaign_id}), 200
         
     except Exception as e:
         print(f"Error: {e}")
@@ -51,27 +56,39 @@ def _extract_campaign_id(request):
         data = request.get_json(silent=True) or {}
         return data.get('data', {}).get('id')
 
-def _process_campaign(campaign_id):
-    """Process a Mailchimp campaign and send it to WordPress."""
-    # 1. Fetch campaign data from Mailchimp
-    campaign_data = mailchimp_service.get_complete_campaign(campaign_id)
-    
-    # 2. Parse and structure the content
-    structured_content = content_processor.parse_email_content(campaign_data)
-    
-    # 3. Process and upload images to WordPress
-    uploaded_images = wordpress_service.process_and_upload_images(structured_content["images"])
-    
-    # 4. Create WordPress post with structured content
-    wp_response = wordpress_service.create_post(
-        structured_content["title"],
-        structured_content["text_blocks"],
-        uploaded_images,
-        structured_content["call_to_action"],
-        structured_content.get("embedded_links", [])
-    )
-    
-    return jsonify({
-        "status": "success", 
-        "wordpress_response": wp_response
-    }), 200
+def _process_campaign_async(campaign_id):
+    """Process a Mailchimp campaign asynchronously."""
+    try:
+        print(f"Starting async processing of campaign {campaign_id}")
+        
+        # 1. Fetch campaign data from Mailchimp
+        campaign_data = mailchimp_service.get_complete_campaign(campaign_id)
+        print(f"Campaign data fetched for {campaign_id}")
+        
+        # 2. Parse and structure the content
+        structured_content = content_processor.parse_email_content(campaign_data)
+        print(f"Content processed for {campaign_id}. Found:")
+        print(f"- Text blocks: {len(structured_content.get('text_blocks', []))}")
+        print(f"- Images: {len(structured_content.get('images', []))}")
+        print(f"- CTA: {'Yes' if structured_content.get('call_to_action') else 'No'}")
+        print(f"- Links: {len(structured_content.get('embedded_links', []))}")
+        
+        # 3. Process and upload images to WordPress
+        uploaded_images = wordpress_service.process_and_upload_images(structured_content["images"])
+        print(f"Uploaded {len(uploaded_images)} images for campaign {campaign_id}")
+        
+        # 4. Create WordPress post with structured content
+        wp_response = wordpress_service.create_post(
+            structured_content["title"],
+            structured_content["text_blocks"],
+            uploaded_images,
+            structured_content["call_to_action"],
+            structured_content.get("embedded_links", [])
+        )
+        
+        print(f"Successfully processed campaign {campaign_id}")
+        print(f"WordPress post created: {wp_response.get('link', wp_response.get('id'))}")
+    except Exception as e:
+        import traceback
+        print(f"Error processing campaign {campaign_id}: {e}")
+        print(traceback.format_exc())

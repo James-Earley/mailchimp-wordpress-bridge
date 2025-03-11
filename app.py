@@ -43,56 +43,112 @@ def get_mailchimp_campaign(campaign_id):
 
 def parse_email_content(campaign_data):
     """
-    Extract text blocks, images, and CTA from Mailchimp HTML,
-    skipping logos, signatures, social icons, etc.
+    1. Gather heading(h1..h6), paragraph(p), and lists(ul/ol).
+    2. For each list, create a single "list" block with all <li>.
+    3. Merge consecutive paragraph blocks.
+    4. Label headings with "level" = 1..6.
+    5. Skip unwanted images; gather others.
+    6. Capture CTA from .mcnButton if present.
     """
-    html = campaign_data.get('html', '')
-    soup = BeautifulSoup(html, 'html.parser')
+    from bs4 import BeautifulSoup
+
+    html = campaign_data.get("html", "")
+    soup = BeautifulSoup(html, "html.parser")
 
     structured = {
-        'title': campaign_data.get('subject_line', ''),
-        'text_blocks': [],
-        'images': [],
-        'call_to_action': None
+        "title": campaign_data.get("subject_line", ""),
+        "blocks": [],      # text-based blocks (headings, paragraphs, lists)
+        "images": [],      # filtered images
+        "call_to_action": None
     }
 
-    # 1) Text
-    for elem in soup.find_all(['p', 'li']):
-        text = elem.get_text(strip=True)
-        if text:
-            structured['text_blocks'].append({
-                'type': 'paragraph',
-                'content': text
-            })
+    # --- 1) GATHER HEADINGS, PARAGRAPHS, LISTS IN ORDER ---
+    # We'll look for h1..h6, p, ul, ol in the DOM sequence
+    node_list = soup.find_all(["h1","h2","h3","h4","h5","h6","p","ul","ol"])
+    raw_blocks = []
 
-    # 2) Images (filter out known unwanted items)
-    all_imgs = soup.select('img')
+    for node in node_list:
+        tag = node.name.lower()
+
+        # Get text for headings/paragraph merges
+        if tag in ["h1","h2","h3","h4","h5","h6"]:
+            text = node.get_text(strip=True)
+            if text:
+                level = int(tag[-1])  # h2 -> level 2, etc.
+                raw_blocks.append({
+                    "type": "header",
+                    "level": level,
+                    "content": text
+                })
+
+        elif tag == "p":
+            text = node.get_text(strip=True)
+            if text:
+                raw_blocks.append({
+                    "type": "paragraph",
+                    "content": text
+                })
+
+        elif tag in ["ul","ol"]:
+            # Build a single "list" block with the <li> children
+            items = []
+            lis = node.find_all("li", recursive=False)
+            # (recursive=False ensures we only get the direct <li> in this list,
+            #  not nested lists if any.)
+            for li in lis:
+                li_text = li.get_text(strip=True)
+                if li_text:
+                    items.append(li_text)
+
+            if items:
+                style = "ordered" if tag == "ol" else "unordered"
+                raw_blocks.append({
+                    "type": "list",
+                    "style": style,
+                    "items": items
+                })
+
+    # --- 2) MERGE CONSECUTIVE PARAGRAPHS ---
+    merged_blocks = []
+    for block in raw_blocks:
+        if block["type"] == "paragraph" and merged_blocks:
+            last = merged_blocks[-1]
+            if last["type"] == "paragraph":
+                # Combine them with a blank line in between
+                last["content"] += "\n\n" + block["content"]
+                continue
+        # Otherwise, push it as a new block
+        merged_blocks.append(block)
+
+    structured["blocks"] = merged_blocks
+
+    # --- 3) PARSE IMAGES, SKIP LOGO/SOCIAL/SIGNATURE ---
+    unwanted = ["logo","signature","facebook","twitter","instagram","social","footer"]
+    all_imgs = soup.select("img")
     filtered_images = []
     for img in all_imgs:
-        src = img.get('src') or ''
-        alt = img.get('alt', '')
-        src_lower = src.lower()
-        alt_lower = alt.lower()
+        src = (img.get("src") or "").lower()
+        alt = (img.get("alt") or "").lower()
 
-        # If either alt/src mention these, skip
-        unwanted = ['logo', 'signature', 'facebook', 'twitter', 'instagram', 'footer', 'social']
-        if any(uw in src_lower for uw in unwanted) or any(uw in alt_lower for uw in unwanted):
+        if not src:
+            continue
+        if any(uw in src for uw in unwanted) or any(uw in alt for uw in unwanted):
             continue
 
-        if src:
-            filtered_images.append({
-                'url': src,
-                'alt': alt
-            })
+        # Keep it
+        filtered_images.append({
+            "url": img.get("src"),
+            "alt": img.get("alt","")
+        })
 
-    structured['images'] = filtered_images
+    structured["images"] = filtered_images
 
-    # 3) CTA
-    cta = soup.select_one('a.mcnButton')
+    # --- 4) CTA FROM .mcnButton ---
+    cta = soup.select_one("a.mcnButton")
     if cta:
-        structured['call_to_action'] = {
-            'text': cta.get_text(strip=True),
-            'url': cta.get('href', '')
+        structured["call_to_action"] = {
+            "text": cta.get_text(strip=True),
+            "url": cta.get("href","")
         }
 
     return structured

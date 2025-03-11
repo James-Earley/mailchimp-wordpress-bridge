@@ -53,7 +53,7 @@ class WordPressService:
         resp.raise_for_status()
         return resp.json()
     
-    def create_post(self, title, text_blocks, images, call_to_action):
+    def create_post(self, title, text_blocks, images, call_to_action, embedded_links=None):
         """
         Create a WordPress post with custom meta fields.
         
@@ -62,6 +62,7 @@ class WordPressService:
             text_blocks (list): List of structured text blocks
             images (list): List of image data
             call_to_action (dict): CTA data
+            embedded_links (list, optional): List of embedded links found in the email
             
         Returns:
             dict: WordPress post object
@@ -79,6 +80,10 @@ class WordPressService:
                 "newsletter_cta": json.dumps(call_to_action)
             }
         }
+        
+        # Add embedded links if provided
+        if embedded_links:
+            post_data["meta"]["newsletter_embedded_links"] = json.dumps(embedded_links)
 
         # Create draft post
         resp = requests.post(

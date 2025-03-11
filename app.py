@@ -245,6 +245,12 @@ def mailchimp_webhook():
     Mailchimp calls this with form-encoded data when a campaign is sent.
     We'll parse, upload images, store as WP draft with custom fields.
     """
+
+    print(">>> MAILCHIMP WEBHOOK CALLED!")
+    print("Method is:", request.method)
+    print("Form data:", request.form)
+    print("JSON data:", request.json)
+
     if request.method in ['GET', 'HEAD']:
         return "OK", 200
 
